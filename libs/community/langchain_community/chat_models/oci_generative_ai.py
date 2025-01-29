@@ -93,10 +93,14 @@ def _format_oci_tool_calls(
     for tool_call in tool_calls:
         formatted_tool_calls.append(
             {
-                "id": uuid.uuid4().hex[:],
+                "id": tool_call.id
+                if "id" in tool_call.attribute_map
+                else uuid.uuid4().hex[:],
                 "function": {
                     "name": tool_call.name,
-                    "arguments": json.dumps(tool_call.parameters),
+                    "arguments": json.loads(tool_call.arguments)
+                    if "arguments" in tool_call.attribute_map
+                    else json.dumps(tool_call.parameters),
                 },
                 "type": "function",
             }
@@ -106,8 +110,13 @@ def _format_oci_tool_calls(
 
 def _convert_oci_tool_call_to_langchain(tool_call: Any) -> ToolCall:
     """Convert a OCI GenAI tool call into langchain_core.messages.ToolCall"""
-    _id = uuid.uuid4().hex[:]
-    return ToolCall(name=tool_call.name, args=tool_call.parameters, id=_id)
+    return ToolCall(
+        name=tool_call.name,
+        args=json.loads(tool_call.arguments)
+        if "arguments" in tool_call.attribute_map
+        else tool_call.parameters,
+        id=tool_call.id if "id" in tool_call.attribute_map else uuid.uuid4().hex[:],
+    )
 
 
 class Provider(ABC):
@@ -131,6 +140,12 @@ class Provider(ABC):
     def chat_stream_generation_info(self, event_data: Dict) -> Dict[str, Any]: ...
 
     @abstractmethod
+    def chat_tool_calls(self, response: Any) -> List[Any]: ...
+
+    @abstractmethod
+    def chat_stream_tool_calls(self, event_data: Dict) -> List[Any]: ...
+
+    @abstractmethod
     def get_role(self, message: BaseMessage) -> str: ...
 
     @abstractmethod
@@ -143,6 +158,14 @@ class Provider(ABC):
         self,
         tool: Union[Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool]],
     ) -> Dict[str, Any]: ...
+
+    @abstractmethod
+    def process_tool_choice(
+        self,
+        tool_choice: Optional[
+            Union[dict, str, Literal["auto", "none", "required", "any"], bool]
+        ],
+    ) -> Optional[Any]: ...
 
 
 class CohereProvider(Provider):
@@ -187,11 +210,11 @@ class CohereProvider(Provider):
             "is_search_required": response.data.chat_response.is_search_required,
             "finish_reason": response.data.chat_response.finish_reason,
         }
-        if response.data.chat_response.tool_calls:
+        if self.chat_tool_calls(response):
             # Only populate tool_calls when 1) present on the response and
             #  2) has one or more calls.
             generation_info["tool_calls"] = _format_oci_tool_calls(
-                response.data.chat_response.tool_calls
+                self.chat_tool_calls(response)
             )
 
         return generation_info
@@ -219,6 +242,12 @@ class CohereProvider(Provider):
         generation_info = {k: v for k, v in generation_info.items() if v is not None}
 
         return generation_info
+
+    def chat_tool_calls(self, response: Any) -> List[Any]:
+        return response.data.chat_response.tool_calls
+
+    def chat_stream_tool_calls(self, event_data: Dict) -> List[Any]:
+        return event_data.get("toolCalls", [])
 
     def get_role(self, message: BaseMessage) -> str:
         if isinstance(message, HumanMessage):
@@ -307,7 +336,7 @@ class CohereProvider(Provider):
 
     def convert_to_oci_tool(
         self,
-        tool: Union[Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool]],
+        tool: Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool],
     ) -> Dict[str, Any]:
         """
         Convert a BaseTool instance, JSON schema dict, or BaseModel type to a OCI tool.
@@ -376,6 +405,20 @@ class CohereProvider(Provider):
                 f"Unsupported tool type {type(tool)}. Tool must be passed in as a BaseTool instance, JSON schema dict, or BaseModel type."  # noqa: E501
             )
 
+    def process_tool_choice(
+        self,
+        tool_choice: Optional[
+            Union[dict, str, Literal["auto", "none", "required", "any"], bool]
+        ],
+    ) -> Optional[Any]:
+        """Tool choice is not supported for Cohere provider."""
+        if tool_choice is not None:
+            raise ValueError(
+                "Tool choice is not supported for Cohere models."
+                "Please remove the tool_choice parameter."
+            )
+        return None
+
 
 class MetaProvider(Provider):
     stop_sequence_key: str = "stop"
@@ -383,20 +426,37 @@ class MetaProvider(Provider):
     def __init__(self) -> None:
         from oci.generative_ai_inference import models
 
+        # Chat request and response models
         self.oci_chat_request = models.GenericChatRequest
         self.oci_chat_message = {
             "USER": models.UserMessage,
             "SYSTEM": models.SystemMessage,
             "ASSISTANT": models.AssistantMessage,
+            "TOOL": models.ToolMessage,
         }
+
+        # Content type models
         self.oci_chat_message_content = models.ChatContent
         self.oci_chat_message_text_content = models.TextContent
         self.oci_chat_message_image_content = models.ImageContent
         self.oci_chat_message_image_url = models.ImageUrl
+
+        # Tool-related models
+        self.oci_function_definition = models.FunctionDefinition
+        self.oci_tool_choice_auto = models.ToolChoiceAuto
+        self.oci_tool_choice_function = models.ToolChoiceFunction
+        self.oci_tool_choice_none = models.ToolChoiceNone
+        self.oci_tool_choice_required = models.ToolChoiceRequired
+        self.oci_tool_call = models.FunctionCall
+        self.oci_tool_message = models.ToolMessage
+
+        # API format
         self.chat_api_format = models.BaseChatRequest.API_FORMAT_GENERIC
 
     def chat_response_to_text(self, response: Any) -> str:
-        return response.data.chat_response.choices[0].message.content[0].text
+        message = response.data.chat_response.choices[0].message
+        content = message.content[0] if message.content else None
+        return content.text if content else ""
 
     def chat_stream_to_text(self, event_data: Dict) -> str:
         return event_data["message"]["content"][0]["text"]
@@ -405,15 +465,28 @@ class MetaProvider(Provider):
         return "message" not in event_data
 
     def chat_generation_info(self, response: Any) -> Dict[str, Any]:
-        return {
+        generation_info: Dict[str, Any] = {
             "finish_reason": response.data.chat_response.choices[0].finish_reason,
             "time_created": str(response.data.chat_response.time_created),
         }
+        if self.chat_tool_calls(response):
+            # Only populate tool_calls when 1) present on the response and
+            #  2) has one or more calls.
+            generation_info["tool_calls"] = _format_oci_tool_calls(
+                self.chat_tool_calls(response)
+            )
+        return generation_info
 
     def chat_stream_generation_info(self, event_data: Dict) -> Dict[str, Any]:
         return {
             "finish_reason": event_data["finishReason"],
         }
+
+    def chat_tool_calls(self, response: Any) -> List[Any]:
+        return response.data.chat_response.choices[0].message.tool_calls
+
+    def chat_stream_tool_calls(self, event_data: Dict) -> List[Any]:
+        return event_data["message"]["tool_calls"]
 
     def get_role(self, message: BaseMessage) -> str:
         # meta only supports alternating user/assistant roles
@@ -423,6 +496,8 @@ class MetaProvider(Provider):
             return "ASSISTANT"
         elif isinstance(message, SystemMessage):
             return "SYSTEM"
+        elif isinstance(message, ToolMessage):
+            return "TOOL"
         else:
             raise ValueError(f"Got unknown type {message}")
 
@@ -444,14 +519,50 @@ class MetaProvider(Provider):
         oci_messages = []
 
         for message in messages:
-            content = self._process_message_content(message.content)
-            oci_message = self.oci_chat_message[self.get_role(message)](content=content)
+            if isinstance(message, ToolMessage):
+                # Handle tool messages
+                tool_content = [
+                    self.oci_chat_message_text_content(text=str(message.content))
+                ]
+                if message.tool_call_id:
+                    oci_message = self.oci_chat_message[self.get_role(message)](
+                        content=tool_content,
+                        tool_call_id=message.tool_call_id,
+                    )
+                else:
+                    oci_message = self.oci_chat_message[self.get_role(message)](
+                        content=tool_content
+                    )
+            elif isinstance(message, AIMessage) and message.additional_kwargs.get(
+                "tool_calls"
+            ):
+                # Handle assistant messages with tool calls
+                content = self._process_message_content(message.content)
+                tool_calls = []
+                for tool_call in message.tool_calls:
+                    tool_calls.append(
+                        self.oci_tool_call(
+                            id=tool_call["id"],
+                            name=tool_call["name"],
+                            arguments=json.dumps(tool_call["args"]),
+                        )
+                    )
+                oci_message = self.oci_chat_message[self.get_role(message)](
+                    content=content,
+                    tool_calls=tool_calls,
+                )
+            else:
+                # Handle regular messages
+                content = self._process_message_content(message.content)
+                oci_message = self.oci_chat_message[self.get_role(message)](
+                    content=content
+                )
+
             oci_messages.append(oci_message)
 
         return {
             "messages": oci_messages,
             "api_format": self.chat_api_format,
-            "top_k": -1,
         }
 
     def _process_message_content(
@@ -507,9 +618,146 @@ class MetaProvider(Provider):
 
     def convert_to_oci_tool(
         self,
-        tool: Union[Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool]],
+        tool: Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool],
     ) -> Dict[str, Any]:
-        raise NotImplementedError("Tools not supported for Meta models")
+        """Convert a BaseTool instance, JSON schema dict, or BaseModel type 
+        to a OCI tool in Meta's format.
+
+        Args:
+            tool: The tool to convert, can be a BaseTool instance, JSON schema dict,
+                or BaseModel type.
+
+        Returns:
+            Dict containing the tool definition in Meta's format.
+
+        Raises:
+            ValueError: If the tool type is not supported.
+        """
+        if isinstance(tool, BaseTool):
+            return self.oci_function_definition(
+                name=tool.name,
+                description=_remove_signature_from_tool_description(
+                    tool.name, tool.description
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        p_name: {
+                            "type": JSON_TO_PYTHON_TYPES.get(
+                                p_def.get("type"), p_def.get("type", "string")
+                            ),
+                            "description": p_def.get("description", ""),
+                        }
+                        for p_name, p_def in tool.args.items()
+                    },
+                    "required": [
+                        p_name
+                        for p_name, p_def in tool.args.items()
+                        if "default" not in p_def
+                    ],
+                },
+            )
+        elif isinstance(tool, dict):
+            if not all(k in tool for k in ("title", "description", "properties")):
+                raise ValueError(
+                    "Unsupported dict type. "
+                    "Tool must be passed in as a BaseTool instance, "
+                    "JSON schema dict, or BaseModel type."
+                )
+            return self.oci_function_definition(
+                name=tool.get("title"),
+                description=tool.get("description"),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        p_name: {
+                            "type": JSON_TO_PYTHON_TYPES.get(
+                                p_def.get("type"), p_def.get("type", "string")
+                            ),
+                            "description": p_def.get("description", ""),
+                        }
+                        for p_name, p_def in tool.get("properties", {}).items()
+                    },
+                    "required": [
+                        p_name
+                        for p_name, p_def in tool.get("properties", {}).items()
+                        if "default" not in p_def
+                    ],
+                },
+            )
+        elif (isinstance(tool, type) and issubclass(tool, BaseModel)) or callable(tool):
+            as_json_schema_function = convert_to_openai_function(tool)
+            parameters = as_json_schema_function.get("parameters", {})
+            return self.oci_function_definition(
+                name=as_json_schema_function.get("name"),
+                description=as_json_schema_function.get(
+                    "description",
+                    as_json_schema_function.get("name"),
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": parameters.get("properties", {}),
+                    "required": parameters.get("required", []),
+                },
+            )
+        else:
+            raise ValueError(
+                f"Unsupported tool type {type(tool)}. "
+                "Tool must be passed in as a BaseTool "
+                "instance, JSON schema dict, or BaseModel type."
+            )
+
+    def process_tool_choice(
+        self,
+        tool_choice: Optional[
+            Union[dict, str, Literal["auto", "none", "required", "any"], bool]
+        ],
+    ) -> Optional[Any]:
+        """Process tool choice for Meta provider.
+
+        Args:
+            tool_choice: Which tool to require the model to call. Options are:
+                - str of the form "<<tool_name>>": calls <<tool_name>> tool.
+                - "auto": automatically selects a tool (including no tool).
+                - "none": does not call a tool.
+                - "any" or "required" or True: force at least one tool to be called.
+                - dict of the form 
+                    {"type": "function", "function": {"name": <<tool_name>>}}: 
+                calls <<tool_name>> tool.
+                - False or None: no effect, default Meta behavior.
+
+        Returns:
+            Meta-specific tool choice object.
+
+        Raises:
+            ValueError: If tool_choice type is not recognized.
+        """
+        if tool_choice is None:
+            return None
+
+        if isinstance(tool_choice, str):
+            if tool_choice not in ("auto", "none", "any", "required"):
+                # For Meta, we use ToolChoiceFunction for specific tool selection
+                return self.oci_tool_choice_function(name=tool_choice)
+            elif tool_choice == "auto":
+                return self.oci_tool_choice_auto()
+            elif tool_choice == "none":
+                return self.oci_tool_choice_none()
+            elif tool_choice in ("any", "required"):
+                return self.oci_tool_choice_required()
+        elif isinstance(tool_choice, bool):
+            if tool_choice:
+                return self.oci_tool_choice_required()
+            else:
+                return self.oci_tool_choice_none()
+        elif isinstance(tool_choice, dict):
+            # For Meta, we use ToolChoiceAuto for specific tool selection
+            return self.oci_tool_choice_auto()
+
+        raise ValueError(
+            f"Unrecognized tool_choice type. Expected str, bool or dict. "
+            f"Received: {tool_choice}"
+        )
 
 
 class ChatOCIGenAI(BaseChatModel, OCIGenAIBase):
@@ -646,9 +894,39 @@ class ChatOCIGenAI(BaseChatModel, OCIGenAIBase):
     def bind_tools(
         self,
         tools: Sequence[Union[Dict[str, Any], Type[BaseModel], Callable, BaseTool]],
+        *,
+        tool_choice: Optional[
+            Union[dict, str, Literal["auto", "none", "required", "any"], bool]
+        ] = None,
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, BaseMessage]:
+        """Bind tool-like objects to this chat model.
+
+        Assumes model is compatible with Meta's tool-calling API.
+
+        Args:
+            tools: A list of tool definitions to bind to this chat model.
+                Can be a dictionary, pydantic model, or callable. Pydantic
+                models and callables will be automatically converted to
+                their schema dictionary representation.
+            tool_choice: Which tool to require the model to call. Options are:
+                - str of the form "<<tool_name>>": calls <<tool_name>> tool.
+                - "auto": automatically selects a tool (including no tool).
+                - "none": does not call a tool.
+                - "any" or "required" or True: force at least one tool to be called.
+                - dict of the form 
+                    {"type": "function", "function": {"name": <<tool_name>>}}: 
+                    calls <<tool_name>> tool.
+                - False or None: no effect, default Meta behavior.
+            kwargs: Any additional parameters are passed directly to
+                :meth:`~langchain_community.chat_models.oci_generative_ai.ChatOCIGenAI.bind`.
+        """
+
         formatted_tools = [self._provider.convert_to_oci_tool(tool) for tool in tools]
+
+        if tool_choice is not None:
+            kwargs["tool_choice"] = self._provider.process_tool_choice(tool_choice)
+
         return super().bind(tools=formatted_tools, **kwargs)
 
     def with_structured_output(
@@ -798,7 +1076,7 @@ class ChatOCIGenAI(BaseChatModel, OCIGenAIBase):
         if "tool_calls" in generation_info:
             tool_calls = [
                 _convert_oci_tool_call_to_langchain(tool_call)
-                for tool_call in response.data.chat_response.tool_calls
+                for tool_call in self._provider.chat_tool_calls(response)
             ]
         else:
             tool_calls = []
